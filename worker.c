@@ -5,137 +5,113 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/msg.h>
-
-const int BUFF_SZ = sizeof(int)*2;
-int shm_key;
-int shm_id;
-
-// Define PERMS
-#define PERMS 0700
-
-// Define message buffer structure for message queue communication
-typedef struct msgbuffer {
-    long mtype;
-    int intData;
-} msgbuffer;
+#include <time.h>
+#include "shared.h"
 
 int main(int argc, char *argv[]) {
-    msgbuffer buf;
-    buf.mtype = 1; // Set message type to 1 for worker messages
-    int msqid = 0;
-    key_t msg_key;
-
-    // Get a key for our message queue
-    if ((msg_key = ftok("msgq.txt", 1)) == -1) {
-        perror("ftok");
-        exit(1);
-    }
-    
-    // Create message queue
-    if ((msqid = msgget(msg_key, PERMS)) == -1) {
-        perror("msgget in child");
+    if (argc < 2) {
+        fprintf(stderr, "Usage: worker t\n");
         exit(1);
     }
 
-    printf("Worker %d has access to the queue \n", getpid());
+    double t_limit = atof(argv[1]);
+    srand(time(NULL) ^ (getpid() << 16));
 
-    if (argc != 3) {
-        fprintf(stderr, "Usage: worker sec nonosec\n");
-        exit(1);
-    }
+    key_t shm_key = ftok("oss.c", 'R');
+    int shm_id = shmget(shm_key, sizeof(int) * 2, PERMS);
+    int *clockptr = (int *)shmat(shm_id, NULL, 0);
+    int *sec = &clockptr[0];
+    int *nano = &clockptr[1];
+
+    key_t msg_key = ftok("msgq.txt", 1);
+    int msqid = msgget(msg_key, PERMS);
+
+    int resources_held[NUM_RESOURCES] = {0};
     
-    int run_sec = atoi(argv[1]);
-    int run_nano = atoi(argv[2]);
-    
-    
-    // Shared memory
-    shm_key = ftok("oss.c", 'R');
-    if (shm_key <= 0 ) {
-        fprintf(stderr,"Child:... Error in ftok\n");
-        exit(1);
-    }
-    
-    // Create shared memory segment
-    shm_id = shmget(shm_key,BUFF_SZ, PERMS);
-    if (shm_id <= 0 ) {
-        fprintf(stderr,"child:... Error in shmget\n");
-        exit(1);
-    }
-    
-    // Attach to the shared memory segment
-    int *clock = (int *)shmat(shm_id,0,0);
-    if (clock == (void *) -1) {
-        fprintf(stderr,"Child:... Error in shmat\n");
-        exit(1);
-    }
-    
-    // Access the shared memory
-    int *sec = &(clock[0]);
-    int *nano = &(clock[1]);
+    // Determine termination time
+    int run_sec = (int)(((double)rand() / RAND_MAX) * t_limit);
+    int run_nano = (int)(((double)rand() / RAND_MAX) * 1000000000);
+    int term_sec = *sec + run_sec;
+    int term_nano = *nano + run_nano;
+    if (term_nano >= 1000000000) { term_sec++; term_nano -= 1000000000; }
 
-    int start_sec = *sec;
-    int start_nano = *nano;
+    msgbuffer msg;
 
-    int term_sec = start_sec + run_sec;
-    int term_nano = start_nano + run_nano;
-
-    if (term_nano >= 1000000000) {
-        term_sec++;
-        term_nano -= 1000000000;
-    }
-
-    printf("WORKER PID:%d PPID:%d\n", getpid(), getppid());
-    printf("SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d\n", start_sec, start_nano, term_sec, term_nano);
-    printf("--Just Starting\n");
-
-    int last_printed_sec = start_sec;
-
-    int messages_recieved = 0;
-
-    // Main loop to check time and print status
     while (1) {
-        // Wait for a message from the parent befor checking time and printing status
-        if (msgrcv(msqid, &buf, sizeof(msgbuffer)-sizeof(long), getpid(), 0) == -1) {
-            perror("Failed to recieve message from parent\n");
-            exit(1);
-        }
-        
-        messages_recieved++;
+        // Wait for permission from oss
+        if (msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0) == -1) break;
 
-        // Check the clock against the termination time
+        // Check if time to terminate
         if (*sec > term_sec || (*sec == term_sec && *nano >= term_nano)) {
-            printf("WORKER PID:%d PPID:%d\n", getpid(), getppid());
-            printf("SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d\n", *sec, *nano, term_sec, term_nano);
-            printf("--Terminating after %d recieved messages.\n", messages_recieved);
-            buf.mtype = 1; // Set message type to 1 for worker messages
-            buf.intData = 0; // Set intData to 0 to indicate termination to the parent
-            
-            // Send a message back to the parent  
-            if (msgsnd(msqid, &buf, sizeof(msgbuffer)-sizeof(long), 0) == -1) {
-                perror("Failed to send msgsnd to parent.\n");
-                exit(1);
-            }
+            msg.mtype = 1;
+            msg.intData = 0; // Terminate
+            msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
             break;
         }
 
-        // Periodically print status every second
-        if (*sec > last_printed_sec) {
-            printf("WORKER PID:%d PPID:%d\n", getpid(), getppid());
-            printf("SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d\n", *sec, *nano, term_sec, term_nano);
-            printf("--%d messages recieved from oss\n", messages_recieved);
-            last_printed_sec = *sec;
-        }
+        // Decide: Request (70%) or Release (30%)
+        int action = rand() % 100;
+        if (action < 70) {
+            // Request
+            int res = rand() % NUM_RESOURCES;
+            if (resources_held[res] < INSTANCES_PER_RESOURCE) {
+                msg.mtype = 1;
+                msg.intData = res + 1;
+                msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                
+                // Wait for grant
+                msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
+                resources_held[res]++;
+            } else {
+                // Cannot request more of this resource, just tell oss we are still alive
+                // Actually, oss expects a message back if it gave us permission.
+                // But my oss loop waits for a response after sending permission.
+                // So I MUST send something.
+                // Let's just try to release something instead or just send a dummy release if possible.
+                // Or just pick another resource.
+                int found = -1;
+                for(int j=0; j<NUM_RESOURCES; j++) if(resources_held[j] < INSTANCES_PER_RESOURCE) { found = j; break; }
+                if (found != -1) {
+                    msg.mtype = 1;
+                    msg.intData = found + 1;
+                    msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                    msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
+                    resources_held[found]++;
+                } else {
+                    // Holding all resources? Terminate.
+                    msg.mtype = 1;
+                    msg.intData = 0;
+                    msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                    break;
+                }
+            }
+        } else {
+            // Release
+            int has_any = 0;
+            for(int j=0; j<NUM_RESOURCES; j++) if(resources_held[j] > 0) has_any = 1;
 
-        buf.mtype = 1; // Set message type to 1 for worker messages
-        buf.intData = 1; // Set intData to 1 to indicate still running to the parent
-
-        // Send a message back to the parent  
-        if (msgsnd(msqid, &buf, sizeof(msgbuffer)-sizeof(long), 0) == -1) {
-            perror("Failed to send msgsnd to parent.\n");
-            exit(1);
+            if (has_any) {
+                int res;
+                do { res = rand() % NUM_RESOURCES; } while (resources_held[res] == 0);
+                msg.mtype = 1;
+                msg.intData = -(res + 1);
+                msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                
+                // Wait for ACK
+                msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
+                resources_held[res]--;
+            } else {
+                // Nothing to release, just request instead
+                int res = rand() % NUM_RESOURCES;
+                msg.mtype = 1;
+                msg.intData = res + 1;
+                msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
+                resources_held[res]++;
+            }
         }
     }
 
-    shmdt(clock);
+    shmdt(clockptr);
     return 0;
 }
