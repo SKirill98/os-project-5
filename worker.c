@@ -13,12 +13,13 @@ int shm_id;
 
 int main(int argc, char *argv[]) {
     // Check whether the right number of arguments were passed.
-    if (argc < 2) {
-        fprintf(stderr, "Usage: worker t\n");
+    if (argc != 3) {
+        fprintf(stderr, "Usage: worker sec nano\n");
         exit(1);
     }
 
-    double t_limit = atof(argv[1]);
+    int term_sec = atoi(argv[1]);
+    int term_nano = atoi(argv[2]);
     srand(time(NULL) ^ (getpid() << 16));
 
     // Shared memory
@@ -56,13 +57,6 @@ int main(int argc, char *argv[]) {
     printf("Worker %d has access to the queue \n", getpid());
 
     int resources_held[NUM_RESOURCES] = {0};
-    
-    // Determine termination time
-    int run_sec = (int)(((double)rand() / RAND_MAX) * t_limit);
-    int run_nano = (int)(((double)rand() / RAND_MAX) * 1000000000);
-    int term_sec = *sec + run_sec;
-    int term_nano = *nano + run_nano;
-    if (term_nano >= 1000000000) { term_sec++; term_nano -= 1000000000; }
 
     printf("WORKER PID:%d PPID:%d\n", getpid(), getppid());
     printf("SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d\n", *sec, *nano, term_sec, term_nano);
@@ -85,12 +79,12 @@ int main(int argc, char *argv[]) {
             break;
         }
 
-        // Decide: Request (70%) or Release (30%)
+        // Decide: Request (80%) or Release (20%)
         int action = rand() % 100;
-        if (action < 70) {
+        if (action < 80) {
             // Request
             int res = rand() % NUM_RESOURCES;
-            if (resources_held[res] < INSTANCES_PER_RESOURCE) {
+            if (resources_held[res] < INSTANCES_PER_RESOURCE) { // There are available instances of these resources to request
                 msg.mtype = 1;
                 msg.intData = res + 1;
                 msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
@@ -99,29 +93,32 @@ int main(int argc, char *argv[]) {
                 msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
                 resources_held[res]++;
             } else {
-                // Cannot request more of this resource, just tell oss we are still alive
-                // Actually, oss expects a message back if it gave us permission.
-                // But my oss loop waits for a response after sending permission.
-                // So I MUST send something.
-                // Let's just try to release something instead or just send a dummy release if possible.
-                // Or just pick another resource.
+                // Cannot request more of this resource
                 int found = -1;
                 for(int j=0; j<NUM_RESOURCES; j++) if(resources_held[j] < INSTANCES_PER_RESOURCE) { found = j; break; }
-                if (found != -1) {
+                if (found != -1) { // Can request a different resource
                     msg.mtype = 1;
                     msg.intData = found + 1;
                     msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+
+                    // Wait for grant
                     msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
                     resources_held[found]++;
                 } else {
-                    // Holding all resources? Terminate.
+                    // Holding all resources? Release one instead of requesting
                     printf("WORKER PID:%d PPID:%d\n", getpid(), getppid());
                     printf("SysClockS:%d SysClockNano:%d TermTimeS:%d TermTimeNano:%d\n", *sec, *nano, term_sec, term_nano);
-                    printf("--Terminating because holding all resources\n");
+                    printf("--Holding max of all resources, releasing one instead of requesting\n");
+                    
+                    int res;
+                    do { res = rand() % NUM_RESOURCES; } while (resources_held[res] == 0);
                     msg.mtype = 1;
-                    msg.intData = 0;
+                    msg.intData = -(res + 1);
                     msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
-                    break;
+                
+                    // Wait for ACK
+                    msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
+                    resources_held[res]--;
                 }
             }
         } else {
@@ -145,6 +142,8 @@ int main(int argc, char *argv[]) {
                 msg.mtype = 1;
                 msg.intData = res + 1;
                 msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                
+                // Wait for grant
                 msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), getpid(), 0);
                 resources_held[res]++;
             }

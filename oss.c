@@ -10,6 +10,7 @@
 #include <time.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <sys/msg.h>
 #include "shared.h"
 
@@ -55,6 +56,60 @@ void log_msg(const char *fmt, ...) {
         va_end(args);
         fflush(log_file);
     }
+}
+
+// Deadlock detection algorithm adapted from example
+bool check_deadlock(int *available, struct PCB *table, int num_procs, int num_res, bool *deadlocked_procs) {
+    int work[num_res];
+    bool finish[num_procs];
+
+    for (int i = 0; i < num_res; i++)
+        work[i] = available[i];
+    
+    for (int i = 0; i < num_procs; i++) {
+        if (!table[i].occupied) {
+            finish[i] = true;
+        } else {
+            finish[i] = false;
+        }
+    }
+
+    bool possible = true;
+    while (possible) {
+        possible = false;
+        for (int p = 0; p < num_procs; p++) {
+            if (!finish[p]) {
+                // Check if request <= work
+                bool can_grant = true;
+                int req = table[p].requested_resource;
+                
+                // In our model, a process only requests ONE resource at a time when blocked
+                if (req != -1) {
+                    if (work[req] < 1) {
+                        can_grant = false;
+                    }
+                }
+
+                if (can_grant) {
+                    finish[p] = true;
+                    for (int i = 0; i < num_res; i++)
+                        work[i] += table[p].resources_allocated[i];
+                    possible = true;
+                }
+            }
+        }
+    }
+
+    bool has_deadlock = false;
+    for (int i = 0; i < num_procs; i++) {
+        if (!finish[i]) {
+            deadlocked_procs[i] = true;
+            has_deadlock = true;
+        } else {
+            deadlocked_procs[i] = false;
+        }
+    }
+    return has_deadlock;
 }
 
 int main(int argc, char *argv[]) {
@@ -180,21 +235,71 @@ int main(int argc, char *argv[]) {
     // Initialize PCB table, resource availability, and request tracking
     struct PCB table[MAX_PCB];
     memset(table, 0, sizeof(table));
-    for(int j=0; j<MAX_PCB; j++) table[j].requested_resource = -1; // -1 means no request
+    for(int j=0; j<MAX_PCB; j++) table[j].requested_resource = -1;
     int resource_available[NUM_RESOURCES];
     for (int j = 0; j < NUM_RESOURCES; j++) resource_available[j] = INSTANCES_PER_RESOURCE;
 
     // Main loop variables
     int running = 0, total_launched = 0, total_requests = 0, granted_immediately = 0;
+    int number_of_runs_of_deadlock_detections = 0; 
+    int number_of_processes_terminated_by_deadlock = 0;
     int last_launch_sec = 0, last_launch_nano = 0;
     int last_print_sec = -1, last_print_nano = -1;
+    int last_deadlock_check_sec = -1;
     int current = -1;
     msgbuffer msg;
+    
 
     while (total_launched < n || running > 0) {
         // Increment clock
         *nano += 10000000;
         if (*nano >= BILLION) { (*sec)++; *nano -= BILLION; }
+
+        // Periodic deadlock detection (every 1 simulated second)
+        if (*sec > last_deadlock_check_sec) {
+            last_deadlock_check_sec = *sec;
+            log_msg("OSS: Running deadlock detection at time %d:%d\n", *sec, *nano);
+            bool deadlocked_procs[MAX_PCB];
+
+            number_of_runs_of_deadlock_detections++;
+            if (check_deadlock(resource_available, table, MAX_PCB, NUM_RESOURCES, deadlocked_procs)) {
+                log_msg("OSS: Deadlock detected! Deadlocked processes: ");
+                for (int j = 0; j < MAX_PCB; j++) {
+                    if (deadlocked_procs[j]) log_msg("P%d ", j);
+                }
+                log_msg("\n");
+
+                // Terminate processes one by one until deadlock is broken
+                for (int j = 0; j < MAX_PCB; j++) {
+                    if (deadlocked_procs[j]) {
+                        log_msg("OSS: Terminating P%d to resolve deadlock\n", j);
+                        kill(table[j].pid, SIGKILL);
+                        number_of_processes_terminated_by_deadlock++;
+                        for (int k = 0; k < NUM_RESOURCES; k++) {
+                            resource_available[k] += table[j].resources_allocated[k];
+                            table[j].resources_allocated[k] = 0;
+                        }
+                        waitpid(table[j].pid, NULL, 0);
+                        table[j].occupied = 0;
+                        table[j].pid = 0;
+                        table[j].start_sec = 0; table[j].start_nanosec = 0;
+                        table[j].end_sec = 0; table[j].end_nano = 0;
+                        table[j].blocked = 0;
+                        table[j].requested_resource = -1;
+                        running--;
+
+                        number_of_runs_of_deadlock_detections++;
+                        // Re-check deadlock after one termination
+                        if (!check_deadlock(resource_available, table, MAX_PCB, NUM_RESOURCES, deadlocked_procs)) {
+                            log_msg("OSS: Deadlock resolved after terminating P%d\n", j);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                log_msg("OSS: No deadlock detected at time %d:%d\n", *sec, *nano);
+            }
+        }
 
         // Check for unblocking
         for (int j = 0; j < MAX_PCB; j++) {
@@ -207,7 +312,7 @@ int main(int argc, char *argv[]) {
                     table[j].requested_resource = -1;
                     log_msg("OSS: Master granting P%d blocked request for R%d at time %d:%d\n", j, res, *sec, *nano);
                     msg.mtype = table[j].pid;
-                    msg.intData = 1; // Granted
+                    msg.intData = 1; 
                     msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
                 }
             }
@@ -221,14 +326,47 @@ int main(int argc, char *argv[]) {
             int index = -1;
             for (int j = 0; j < MAX_PCB; j++) if (!table[j].occupied) { index = j; break; }
             if (index != -1) {
+                // Generate random CPU Burst time for child between 0 and t seconds
+                double random_runtime = ((double)rand() / RAND_MAX) * t;
+
+                // To prevent weird behavior.
+                if (random_runtime == 0)
+                    random_runtime = 0.000001; // tiny non-zero
+
+                // Convert runtime to sec/nano
+                int run_sec = (int)random_runtime;
+                int run_nano = (int)((random_runtime - run_sec) * BILLION);
+
+                // Determine termination time
+                int start_sec = *sec;
+                int start_nano = *nano;
+
+                int term_sec = start_sec + run_sec;
+                int term_nano = start_nano + run_nano;
+
+                if (term_nano >= 1000000000) {
+                    term_sec++;
+                    term_nano -= 1000000000;
+                }
+                
                 pid_t child = fork();
+
                 if (child == 0) {
-                    char tStr[20]; sprintf(tStr, "%f", t);
-                    execl("./worker", "worker", tStr, NULL);
+                    char secStr[20], nanoStr[20];
+                    sprintf(secStr, "%d", term_sec);
+                    sprintf(nanoStr, "%d", term_nano);
+
+                    execl("./worker", "worker", secStr, nanoStr, NULL);
+                    perror("OSS: execl failed");
                     exit(1);
                 }
-                table[index].occupied = 1; table[index].pid = child;
+
+                table[index].occupied = 1; 
+                table[index].pid = child;
                 table[index].start_sec = *sec; table[index].start_nanosec = *nano;
+                table[index].end_sec = term_sec; table[index].end_nano = term_nano;
+                table[index].blocked = 0;
+                table[index].requested_resource = -1;
                 running++; total_launched++;
                 last_launch_sec = *sec; last_launch_nano = *nano;
                 log_msg("OSS: Master launching P%d at time %d:%d\n", index, *sec, *nano);
@@ -244,51 +382,58 @@ int main(int argc, char *argv[]) {
 
         if (found != -1) {
             msg.mtype = table[found].pid;
-            msg.intData = 1; // Go ahead
+            msg.intData = 1;
             msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
 
-            msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 1, 0);
-            if (msg.intData == 0) { // Terminating
-                log_msg("OSS: Master has acknowledged Process P%d terminating at time %d:%d\n", found, *sec, *nano);
-                for (int j = 0; j < NUM_RESOURCES; j++) {
-                    resource_available[j] += table[found].resources_allocated[j];
-                    table[found].resources_allocated[j] = 0;
-                }
-                waitpid(table[found].pid, NULL, 0);
-                table[found].occupied = 0;
-                running--;
-            } else if (msg.intData > 0) { // Request
-                int res = msg.intData - 1;
-                total_requests++;
-                log_msg("OSS: Master has detected Process P%d requesting R%d at time %d:%d\n", found, res, *sec, *nano);
-                if (resource_available[res] > 0) {
-                    resource_available[res]--;
-                    table[found].resources_allocated[res]++;
-                    granted_immediately++;
-                    log_msg("OSS: Master granting P%d request R%d at time %d:%d\n", found, res, *sec, *nano);
+            if (msgrcv(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 1, 0) != -1) {
+                if (msg.intData == 0) { // Terminating
+                    log_msg("OSS: Master has acknowledged Process P%d terminating at time %d:%d\n", found, *sec, *nano);
+                    for (int j = 0; j < NUM_RESOURCES; j++) {
+                        resource_available[j] += table[found].resources_allocated[j];
+                        table[found].resources_allocated[j] = 0;
+                    }
+                    waitpid(table[found].pid, NULL, 0);
+                    table[found].occupied = 0;
+                    table[found].pid = 0;
+                    table[found].start_sec = 0; table[found].start_nanosec = 0;
+                    table[found].end_sec = 0; table[found].end_nano = 0;
+                    table[found].blocked = 0;
+                    table[found].requested_resource = -1;
+                    running--;
+                } else if (msg.intData > 0) { // Request
+                    int res = msg.intData - 1;
+                    total_requests++;
+                    log_msg("OSS: Master has detected Process P%d requesting R%d at time %d:%d\n", found, res, *sec, *nano);
+                    if (resource_available[res] > 0) {
+                        resource_available[res]--;
+                        table[found].resources_allocated[res]++;
+                        granted_immediately++;
+                        log_msg("OSS: Master granting P%d request R%d at time %d:%d\n", found, res, *sec, *nano);
+                        msg.mtype = table[found].pid;
+                        msg.intData = 1;
+                        msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
+                    } else {
+                        table[found].blocked = 1;
+                        table[found].requested_resource = res;
+                        log_msg("OSS: Master blocking P%d for R%d at time %d:%d\n", found, res, *sec, *nano);
+                    }
+                } else if (msg.intData < 0) { // Release
+                    int res = abs(msg.intData) - 1;
+                    log_msg("OSS: Master has detected Process P%d releasing R%d at time %d:%d\n", found, res, *sec, *nano);
+                    resource_available[res]++;
+                    table[found].resources_allocated[res]--;
                     msg.mtype = table[found].pid;
-                    msg.intData = 1; // Granted
+                    msg.intData = 1;
                     msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
-                } else {
-                    table[found].blocked = 1;
-                    table[found].requested_resource = res;
-                    log_msg("OSS: Master blocking P%d for R%d at time %d:%d\n", found, res, *sec, *nano);
                 }
-            } else if (msg.intData < 0) { // Release
-                int res = abs(msg.intData) - 1;
-                log_msg("OSS: Master has detected Process P%d releasing R%d at time %d:%d\n", found, res, *sec, *nano);
-                resource_available[res]++;
-                table[found].resources_allocated[res]--;
-                msg.mtype = table[found].pid;
-                msg.intData = 1; // Acknowledged
-                msgsnd(msqid, &msg, sizeof(msgbuffer) - sizeof(long), 0);
             }
         }
 
-        // Print tables every 0.5s
-        if (*sec > last_print_sec || (*sec == last_print_sec && *nano >= last_print_nano + 500000000)) {
+        // Print tables every 0.1s
+        if (*sec > last_print_sec || (*sec == last_print_sec && *nano >= last_print_nano + 100000000)) {
             last_print_sec = *sec; last_print_nano = *nano;
 
+            // Print Resource Table
             log_msg("\nOSS: OSS PID:%d SysClockS:%d SysClockNano:%d\n", getpid(), *sec, *nano);
             log_msg("OSS: Resources available:\n");
             for(int j=0; j<NUM_RESOURCES; j++) log_msg("R%d:%d ", j, resource_available[j]);
@@ -302,10 +447,26 @@ int main(int argc, char *argv[]) {
                     log_msg("\n");
                 }
             }
+
+            // Print PCB Table
+            log_msg("OSS: PCB Table:\n");
+            log_msg("\n%-5s %-10s %-8s %-14s %-14s %-14s %-14s %-10s %-7s\n", "Entry","Occupied","PID","StartS","StartN","EndS","EndN","Block","ReqRes");
+            for (int j = 0; j < MAX_PCB; j++) {
+                log_msg("%-5d %-10d %-8d %-14d %-14d %-14d %-14d %-10d %-7d\n", 
+                    j, 
+                    table[j].occupied, 
+                    table[j].pid, 
+                    table[j].start_sec, 
+                    table[j].start_nanosec, 
+                    table[j].end_sec, 
+                    table[j].end_nano, 
+                    table[j].blocked, 
+                    table[j].requested_resource);
+            }
         }
     }
 
-    log_msg("\nOSS: Final Report:\nTotal requests: %d\nGranted immediately: %d (%.2f%%)\n", total_requests, granted_immediately, total_requests > 0 ? (float)granted_immediately/total_requests*100 : 0);
+    log_msg("\nOSS: Final Report: \nAmount of Times Deadlock Detection Ran: %d \nNumber of Processes Terminated by Deadlock: %d \nTotal requests: %d \nGranted immediately: %d (%.2f%%)\n", number_of_runs_of_deadlock_detections, number_of_processes_terminated_by_deadlock, total_requests, granted_immediately, total_requests > 0 ? (float)granted_immediately/total_requests*100 : 0);
     cleanup(0);
     return 0;
 }
